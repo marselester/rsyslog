@@ -113,7 +113,12 @@ void str_split(char **membuf);
 
 int open_mmdb(const char *file, MMDB_s *mmdb);
 void close_mmdb(MMDB_s *mmdb);
-
+int mmdb_get_value(
+	MMDB_entry_s *const start,
+	MMDB_entry_data_s *const entry_data,
+	char *field,
+	size_t field_len
+);
 
 int open_mmdb(const char *file, MMDB_s *mmdb) {
 	int status = MMDB_open(file, MMDB_MODE_MMAP, mmdb);
@@ -131,6 +136,48 @@ int open_mmdb(const char *file, MMDB_s *mmdb) {
 
 void close_mmdb(MMDB_s *mmdb) {
 	MMDB_close(mmdb);
+}
+
+const char *SEP = "!";
+
+int mmdb_get_value(
+	MMDB_entry_s *const start,
+	MMDB_entry_data_s *const entry_data,
+	char *field,
+	size_t field_len
+) {
+	// Count names in the field to construct a path, e.g.,
+	// "!continent!code" implies 2 levels of JSON object {"continent": {"code": "XX"}}.
+	size_t length = 0;
+	for (size_t i = 0; i < field_len; i++) {
+		if (field[i] == *SEP) {
+			length++;
+		}
+	}
+
+	if (length == SIZE_MAX) {
+		return MMDB_INVALID_METADATA_ERROR;
+	}
+
+	const char **path = calloc(length + 1, sizeof(const char *));
+	if (NULL == path) {
+		return MMDB_OUT_OF_MEMORY_ERROR;
+	}
+
+	// Split the field into path elements.
+	const char *path_elem;
+	int i = 0;
+	while (NULL != (path_elem = strtok_r(field, SEP, &field))) {
+		path[i] = path_elem;
+		i++;
+	}
+	path[i] = NULL;
+
+	int status = MMDB_aget_value(start, entry_data, path);
+
+	free(path);
+
+	return status;
 }
 
 static rsRetVal wrkr_reopen_mmdb(wrkrInstanceData_t *pWrkrData) {
@@ -380,8 +427,7 @@ BEGINdoAction_NoStrings
 	struct json_object *keyjson = NULL;
 	const char *pszValue;
 	instanceData *const pData = pWrkrData->pData;
-	json_object *total_json = NULL;
-	MMDB_entry_data_list_s *entry_data_list = NULL;
+	struct json_object *field_json = NULL;
 CODESTARTdoAction
 	/* ensure file is open before beginning */
 	if (!pWrkrData->mmdb_is_open) {
@@ -429,58 +475,105 @@ CODESTARTdoAction
 	}
 
 
-	int status  = MMDB_get_entry_data_list(&result.entry, &entry_data_list);
+	MMDB_entry_data_s entry_data;
+	char value[1024];
+	int value_len = 0;
+	// Extract and amend fields (to message) as configured.
+	for (int i = 0; i < pData->fieldList.nmemb; ++i) {
+		size_t field_len = strnlen((char *)(pData->fieldList.name[i]), 1024);
+		char field[field_len + 1];
+		strncpy(field, (char *)pData->fieldList.name[i], sizeof(field));
+		field[field_len] = '\0'; // Ensure null termination.
 
-	if (MMDB_SUCCESS != status) {
-		dbgprintf("Got an error looking up the entry data - %s\n", MMDB_strerror(status));
-		ABORT_FINALIZE(RS_RET_OK);
-	}
-
-	size_t  memlen;
-	char   *membuf;
-	FILE   *memstream;
-	CHKmalloc(memstream = open_memstream(&membuf, &memlen));
-
-	if (entry_data_list != NULL && memstream != NULL) {
-		MMDB_dump_entry_data_list(memstream, entry_data_list, 2);
-		fflush(memstream);
-		str_split(&membuf);
-	}
-
-	DBGPRINTF("maxmindb returns: '%s'\n", membuf);
-	total_json = json_tokener_parse(membuf);
-	fclose(memstream);
-	free(membuf);
-
-	/* extract and amend fields (to message) as configured */
-	for (int i = 0 ; i <  pData->fieldList.nmemb; ++i) {
-		char *strtok_save;
-		char buf[(strlen((char *)(pData->fieldList.name[i])))+1];
-		strcpy(buf, (char *)pData->fieldList.name[i]);
-
-		json_object *temp_json = total_json;
-		json_object *sub_obj   = temp_json;
-		const char *SEP = "!";
-
-		/* find lowest level JSON object */
-		char *s = strtok_r(buf, SEP, &strtok_save);
-		while(s != NULL) {
-			json_object_object_get_ex(temp_json, s, &sub_obj);
-			temp_json = sub_obj;
-			s = strtok_r(NULL, SEP, &strtok_save);
+		mmdb_err = mmdb_get_value(&result.entry, &entry_data, field, field_len);
+		if (MMDB_SUCCESS != mmdb_err) {
+			dbgprintf("Got an error looking up the entry data - %s\n", MMDB_strerror(mmdb_err));
+			ABORT_FINALIZE(RS_RET_OK);
 		}
-		/* temp_json now contains the value we want to have, so set it */
-		json_object_get(temp_json);
-		msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], temp_json, 0, 0);
+		if (!entry_data.has_data || entry_data.offset <= 0) {
+			continue;
+		}
+
+		value_len = 0;
+		// Decode the value.
+		switch (entry_data.type) {
+		case MMDB_DATA_TYPE_BOOLEAN:
+			value_len = snprintf(value, sizeof(value), "%d", entry_data.boolean);
+			break;
+		case MMDB_DATA_TYPE_UTF8_STRING:
+			value_len = snprintf(
+				value,
+				sizeof(value),
+				"%.*s",
+				entry_data.data_size,
+				entry_data.utf8_string
+			);
+			break;
+		case MMDB_DATA_TYPE_BYTES:
+			value_len = snprintf(
+				value,
+				sizeof(value),
+				"%.*s",
+				entry_data.data_size,
+				(const char *)entry_data.bytes
+			);
+			break;
+		case MMDB_DATA_TYPE_FLOAT:
+			value_len = snprintf(value, sizeof(value), "%.5f", entry_data.float_value);
+			break;
+		case MMDB_DATA_TYPE_DOUBLE:
+			value_len = snprintf(value, sizeof(value), "%.5f", entry_data.double_value);
+			break;
+		case MMDB_DATA_TYPE_UINT16:
+			value_len = snprintf(value, sizeof(value), "%" PRIu16, entry_data.uint16);
+			break;
+		case MMDB_DATA_TYPE_UINT32:
+			value_len = snprintf(value, sizeof(value), "%" PRIu32, entry_data.uint32);
+			break;
+		case MMDB_DATA_TYPE_INT32:
+			value_len = snprintf(value, sizeof(value), "%" PRIi32, entry_data.int32);
+			break;
+		case MMDB_DATA_TYPE_UINT64:
+			value_len = snprintf(value, sizeof(value), "%" PRIu64, entry_data.uint64);
+			break;
+		case MMDB_DATA_TYPE_UINT128: {
+			uint8_t *p = (uint8_t *)&entry_data.uint128;
+			value_len = snprintf(
+				value,
+				sizeof(value),
+				"0x"
+				"%02x%02x%02x%02x"
+				"%02x%02x%02x%02x"
+				"%02x%02x%02x%02x"
+				"%02x%02x%02x%02x",
+				p[0], p[1], p[2], p[3],
+				p[4], p[5], p[6], p[7],
+				p[8], p[9], p[10], p[11],
+				p[12], p[13], p[14], p[15]
+			);
+			break;
+		}
+		default:
+			dbgprintf("Got an error looking up the entry data - unknown data type\n");
+			ABORT_FINALIZE(RS_RET_OK);
+		}
+
+		if (value_len <= 0) {
+			continue;
+		}
+
+		CHKmalloc(field_json = json_object_new_string(value));
+
+		// field_json now contains the geoip field, so set it to the message.
+		msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], field_json, 0, 0);
 	}
 
 finalize_it:
 	pthread_mutex_unlock(&pWrkrData->mmdbMutex);
-	if(entry_data_list != NULL)
-		MMDB_free_entry_data_list(entry_data_list);
 	json_object_put(keyjson);
-	if(total_json != NULL)
-		json_object_put(total_json);
+	if (NULL != field_json) {
+		json_object_put(field_json);
+	}
 ENDdoAction
 
 // HUP handling for the worker...
