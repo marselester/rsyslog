@@ -109,16 +109,14 @@ static struct cnfparamblk actpblk = {
 
 
 /* protype functions */
-void str_split(char **membuf);
-
 int open_mmdb(const char *file, MMDB_s *mmdb);
 void close_mmdb(MMDB_s *mmdb);
 int mmdb_get_value(
 	MMDB_entry_s *const start,
 	MMDB_entry_data_s *const entry_data,
-	char *field,
-	size_t field_len
+	char *field
 );
+struct json_object *mmdb_entry_to_json(const MMDB_entry_data_s *entry);
 
 int open_mmdb(const char *file, MMDB_s *mmdb) {
 	int status = MMDB_open(file, MMDB_MODE_MMAP, mmdb);
@@ -139,37 +137,28 @@ void close_mmdb(MMDB_s *mmdb) {
 }
 
 const char *SEP = "!";
+#define MAX_PATH_ELEMENTS 7
 
+// This is a thin wrapper function for MMDB_aget_value that knows how to convert
+// the rsyslog field into MMDB path, e.g., "!continent!code" -> ["continent", "code"].
 int mmdb_get_value(
 	MMDB_entry_s *const start,
 	MMDB_entry_data_s *const entry_data,
-	char *field,
-	size_t field_len
+	char *field
 ) {
-	// Count names in the field to construct a path, e.g.,
-	// "!continent!code" implies 2 levels of JSON object {"continent": {"code": "XX"}}.
-	size_t length = 0;
-	for (size_t i = 0; i < field_len; i++) {
-		if (field[i] == *SEP) {
-			length++;
-		}
-	}
-
-	if (length == SIZE_MAX) {
-		return MMDB_INVALID_METADATA_ERROR;
-	}
-
-	const char **path = calloc(length + 1, sizeof(const char *));
+	const char **path = calloc(MAX_PATH_ELEMENTS + 1, sizeof(const char *));
 	if (NULL == path) {
 		return MMDB_OUT_OF_MEMORY_ERROR;
 	}
 
-	// Split the field into path elements.
-	const char *path_elem;
+	// Split the field into path elements to construct a path array.
 	int i = 0;
-	while (NULL != (path_elem = strtok_r(field, SEP, &field))) {
+	char *brkf;
+	char *path_elem = strtok_r(field, SEP, &brkf);
+	while (NULL != path_elem && i < MAX_PATH_ELEMENTS) {
 		path[i] = path_elem;
 		i++;
+		path_elem = strtok_r(NULL, SEP, &brkf);
 	}
 	path[i] = NULL;
 
@@ -178,6 +167,102 @@ int mmdb_get_value(
 	free(path);
 
 	return status;
+}
+
+// Helper function to convert MMDB_entry_data_s to json_object.
+struct json_object *mmdb_entry_to_json(const MMDB_entry_data_s *entry) {
+	if (!entry || entry->offset == 0) {
+		return NULL;
+	}
+
+	switch (entry->type) {
+	case MMDB_DATA_TYPE_UTF8_STRING:
+		return json_object_new_string_len(entry->utf8_string, entry->data_size);
+	case MMDB_DATA_TYPE_BYTES:
+		char *hex_string = calloc((entry->data_size * 2) + 1, sizeof(char));
+		if (NULL == hex_string) {
+			dbgprintf("Error converting MMDB bytes to hex string\n");
+			return NULL;
+		}
+
+		for (uint32_t i = 0; i < entry->data_size; i++) {
+			sprintf(hex_string + (2 * i), "%02X", entry->bytes[i]);
+		}
+
+		struct json_object *json_string = json_object_new_string_len(
+			hex_string,
+			entry->data_size * 2
+		);
+		free(hex_string);
+
+		return json_string;
+	case MMDB_DATA_TYPE_DOUBLE:
+		return json_object_new_double(entry->double_value);
+	case MMDB_DATA_TYPE_FLOAT:
+		return json_object_new_double((double)entry->float_value);
+	case MMDB_DATA_TYPE_BOOLEAN:
+		return json_object_new_boolean(entry->boolean);
+	case MMDB_DATA_TYPE_UINT16:
+		return json_object_new_int((int)entry->uint16);
+	case MMDB_DATA_TYPE_UINT32:
+		return json_object_new_int((int)entry->uint32);
+	case MMDB_DATA_TYPE_INT32:
+		return json_object_new_int(entry->int32);
+	case MMDB_DATA_TYPE_UINT64:
+		return json_object_new_int64((int64_t)entry->uint64);
+	case MMDB_DATA_TYPE_UINT128: {
+		// json-c doesn't have a direct 128-bit integer type.
+		// Representing it as a string might be the best approach for lossless conversion.
+		char buffer[40];
+		snprintf(
+			buffer,
+			sizeof(buffer),
+			"%llu%016llu",
+			(unsigned long long)(entry->uint128 >> 64),
+			(unsigned long long)(entry->uint128 & 0xFFFFFFFFFFFFFFFFULL)
+		);
+		return json_object_new_string(buffer);
+	}
+	case MMDB_DATA_TYPE_ARRAY: {
+		json_object *json_array = json_object_new_array();
+		MMDB_entry_data_list_s *list = entry;
+		while (list) {
+			json_object_array_add(
+				json_array,
+				mmdb_entry_to_json(&list->entry_data)
+			);
+			list = list->next;
+		}
+		return json_array;
+	}
+	case MMDB_DATA_TYPE_MAP: {
+		struct json_object *json_map_obj = json_object_new_object();
+		MMDB_entry_data_list_s *list = entry;
+		while (list) {
+			// The key in a map is always a UTF-8 string.
+			if (MMDB_DATA_TYPE_UTF8_STRING == list->entry_data.type) {
+				MMDB_entry_data_list_s *value_list = list->next;
+				if (value_list) {
+					json_object_object_add(
+						json_map_obj,
+						list->entry_data.utf8_string,
+						mmdb_entry_to_json(&value_list->entry_data));
+					list = value_list->next;
+				} else {
+					dbgprintf("MMDB map key without a value\n");
+					list = NULL;
+				}
+			} else {
+				dbgprintf("Non-string key in MMDB map\n");
+				list = list->next;
+			}
+		}
+		return json_map_obj;
+	}
+	default:
+		dbgprintf("Unknown MMDB data type %d\n", entry->type);
+		return NULL;
+	}
 }
 
 static rsRetVal wrkr_reopen_mmdb(wrkrInstanceData_t *pWrkrData) {
@@ -381,53 +466,12 @@ CODESTARTtryResume
 ENDtryResume
 
 
-void
-str_split(char **membuf)
-{
-	int in_quotes = 0;
-	char *buf  = *membuf;
-	char tempbuf[strlen(buf)];
-	memset(tempbuf, 0, strlen(buf));
-
-	while (*buf++ != '\0') {
-		if (in_quotes) {
-			if (*buf == '"' && *(buf - 1) != '\\') {
-				in_quotes = !in_quotes;
-				strncat(tempbuf, buf, 1);
-			} else {
-				strncat(tempbuf, buf, 1);
-			}
-		} else {
-			if (*buf == '\n' || *buf == '\t' || *buf == ' ')
-				continue;
-			if (*buf == '<') {
-				char *p = strchr(buf, '>');
-				buf = buf + (int)(p - buf);
-				strcat(tempbuf, ",");
-			} else if (*buf == '}') {
-				strcat(tempbuf, "},");
-			} else if (*buf == ']') {
-				strcat(tempbuf, "],");
-			} else if (*buf == '"' && *(buf - 1) != '\\') {
-				in_quotes = !in_quotes;
-				strncat(tempbuf, buf, 1);
-			} else {
-				strncat(tempbuf, buf, 1);
-			}
-		}
-	}
-
-	memcpy(*membuf, tempbuf, strlen(tempbuf)+1);
-}
-
-
 BEGINdoAction_NoStrings
 	smsg_t **ppMsg = (smsg_t **) pMsgData;
 	smsg_t *pMsg   = ppMsg[0];
 	struct json_object *keyjson = NULL;
 	const char *pszValue;
 	instanceData *const pData = pWrkrData->pData;
-	struct json_object *field_json = NULL;
 CODESTARTdoAction
 	/* ensure file is open before beginning */
 	if (!pWrkrData->mmdb_is_open) {
@@ -474,18 +518,20 @@ CODESTARTdoAction
 		ABORT_FINALIZE(RS_RET_OK);
 	}
 
-
+	const size_t max_field_len = 255;
 	MMDB_entry_data_s entry_data;
-	char value[1024];
-	int value_len = 0;
 	// Extract and amend fields (to message) as configured.
+	//
+	// For example, if the field is "!continent!code", we will get {"continent": {"code": "AS"}}.
+	// Another example is "location" which implies getting the whole location object:
+	// {"location": {"accuracy_radius": 50, "latitude": 34.772500, "longitude": 113.726600}.
 	for (int i = 0; i < pData->fieldList.nmemb; ++i) {
-		size_t field_len = strnlen((char *)(pData->fieldList.name[i]), 1024);
+		size_t field_len = strnlen((char *)(pData->fieldList.name[i]), max_field_len);
 		char field[field_len + 1];
 		strncpy(field, (char *)pData->fieldList.name[i], sizeof(field));
 		field[field_len] = '\0'; // Ensure null termination.
 
-		mmdb_err = mmdb_get_value(&result.entry, &entry_data, field, field_len);
+		mmdb_err = mmdb_get_value(&result.entry, &entry_data, field);
 		if (MMDB_SUCCESS != mmdb_err) {
 			dbgprintf("Got an error looking up the entry data - %s\n", MMDB_strerror(mmdb_err));
 			ABORT_FINALIZE(RS_RET_OK);
@@ -494,86 +540,19 @@ CODESTARTdoAction
 			continue;
 		}
 
-		value_len = 0;
-		// Decode the value.
-		switch (entry_data.type) {
-		case MMDB_DATA_TYPE_BOOLEAN:
-			value_len = snprintf(value, sizeof(value), "%d", entry_data.boolean);
-			break;
-		case MMDB_DATA_TYPE_UTF8_STRING:
-			value_len = snprintf(
-				value,
-				sizeof(value),
-				"%.*s",
-				entry_data.data_size,
-				entry_data.utf8_string
-			);
-			break;
-		case MMDB_DATA_TYPE_BYTES:
-			value_len = snprintf(
-				value,
-				sizeof(value),
-				"%.*s",
-				entry_data.data_size,
-				(const char *)entry_data.bytes
-			);
-			break;
-		case MMDB_DATA_TYPE_FLOAT:
-			value_len = snprintf(value, sizeof(value), "%.5f", entry_data.float_value);
-			break;
-		case MMDB_DATA_TYPE_DOUBLE:
-			value_len = snprintf(value, sizeof(value), "%.5f", entry_data.double_value);
-			break;
-		case MMDB_DATA_TYPE_UINT16:
-			value_len = snprintf(value, sizeof(value), "%" PRIu16, entry_data.uint16);
-			break;
-		case MMDB_DATA_TYPE_UINT32:
-			value_len = snprintf(value, sizeof(value), "%" PRIu32, entry_data.uint32);
-			break;
-		case MMDB_DATA_TYPE_INT32:
-			value_len = snprintf(value, sizeof(value), "%" PRIi32, entry_data.int32);
-			break;
-		case MMDB_DATA_TYPE_UINT64:
-			value_len = snprintf(value, sizeof(value), "%" PRIu64, entry_data.uint64);
-			break;
-		case MMDB_DATA_TYPE_UINT128: {
-			uint8_t *p = (uint8_t *)&entry_data.uint128;
-			value_len = snprintf(
-				value,
-				sizeof(value),
-				"0x"
-				"%02x%02x%02x%02x"
-				"%02x%02x%02x%02x"
-				"%02x%02x%02x%02x"
-				"%02x%02x%02x%02x",
-				p[0], p[1], p[2], p[3],
-				p[4], p[5], p[6], p[7],
-				p[8], p[9], p[10], p[11],
-				p[12], p[13], p[14], p[15]
-			);
-			break;
-		}
-		default:
-			dbgprintf("Got an error looking up the entry data - unknown data type\n");
-			ABORT_FINALIZE(RS_RET_OK);
-		}
-
-		if (value_len <= 0) {
+		struct json_object *field_json = mmdb_entry_to_json(&entry_data);
+		if (NULL == field_json) {
 			continue;
 		}
 
-		CHKmalloc(field_json = json_object_new_string(value));
-
 		// field_json now contains the geoip field, so set it to the message.
 		msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], field_json, 0, 0);
+		json_object_put(field_json);
 	}
 
 finalize_it:
 	pthread_mutex_unlock(&pWrkrData->mmdbMutex);
 	json_object_put(keyjson);
-	if (NULL != field_json) {
-		json_object_put(field_json);
-	}
 ENDdoAction
 
 // HUP handling for the worker...
