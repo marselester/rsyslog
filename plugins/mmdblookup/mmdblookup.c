@@ -373,6 +373,137 @@ str_split(char **membuf)
 	memcpy(*membuf, tempbuf, strlen(tempbuf)+1);
 }
 
+typedef struct {
+	struct json_object *json;
+	MMDB_entry_data_list_s *next;
+	int status;
+} mmdb_json;
+
+static mmdb_json mmdb_entry_data_list_to_json(MMDB_entry_data_list_s *entry_data_list) {
+	mmdb_json result = {NULL, NULL, MMDB_SUCCESS};
+
+	switch (entry_data_list->entry_data.type) {
+		case MMDB_DATA_TYPE_MAP: {
+			result.json = json_object_new_object();
+
+			uint32_t size = entry_data_list->entry_data.data_size;
+			for (entry_data_list = entry_data_list->next;
+				 size && entry_data_list;
+				 size--) {
+				if (MMDB_DATA_TYPE_UTF8_STRING != entry_data_list->entry_data.type) {
+					result.status = MMDB_INVALID_DATA_ERROR;
+					return result;
+				}
+
+				const char *key = entry_data_list->entry_data.utf8_string;
+
+				entry_data_list = entry_data_list->next;
+				mmdb_json value = mmdb_entry_data_list_to_json(entry_data_list);
+				entry_data_list = value.next;
+				if (MMDB_SUCCESS != value.status) {
+					return value;
+				}
+
+				json_object_object_add(result.json, key, value.json);
+			}
+
+			result.next = entry_data_list;
+		} break;
+		case MMDB_DATA_TYPE_ARRAY: {
+			result.json = json_object_new_array();
+
+			uint32_t size = entry_data_list->entry_data.data_size;
+			for (entry_data_list = entry_data_list->next;
+				 size && entry_data_list;
+				 size--) {
+				mmdb_json item = mmdb_entry_data_list_to_json(entry_data_list);
+				if (MMDB_SUCCESS != item.status) {
+					return item;
+				}
+
+				json_object_array_add(result.json, item.json);
+				entry_data_list = item.next;
+			}
+
+			result.next = entry_data_list;
+		} break;
+		case MMDB_DATA_TYPE_UTF8_STRING: {
+			result.json = json_object_new_string_len(
+				entry_data_list->entry_data.utf8_string,
+				entry_data_list->entry_data.data_size
+			);
+			result.next = entry_data_list->next;
+		} break;
+		case MMDB_DATA_TYPE_BYTES: {
+			char *hex_string = calloc(
+				(entry_data_list->entry_data.data_size * 2) + 1,
+				sizeof(char)
+			);
+			if (NULL == hex_string) {
+				result.status = MMDB_OUT_OF_MEMORY_ERROR;
+				return result;
+			}
+
+			for (uint32_t i = 0; i < entry_data_list->entry_data.data_size; i++) {
+				sprintf(hex_string + (2 * i), "%02X", entry_data_list->entry_data.bytes[i]);
+			}
+
+			result.json = json_object_new_string_len(
+				hex_string,
+				entry_data_list->entry_data.data_size * 2
+			);
+			free(hex_string);
+
+			result.next = entry_data_list->next;
+		} break;
+		case MMDB_DATA_TYPE_DOUBLE:
+			result.json = json_object_new_double(entry_data_list->entry_data.double_value);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_FLOAT:
+			result.json = json_object_new_double((double)entry_data_list->entry_data.float_value);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_UINT16:
+			result.json = json_object_new_int((int)entry_data_list->entry_data.uint16);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_UINT32:
+			result.json = json_object_new_int((int)entry_data_list->entry_data.uint32);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_BOOLEAN:
+			result.json = json_object_new_boolean(entry_data_list->entry_data.boolean);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_UINT64:
+			result.json = json_object_new_int64((int64_t)entry_data_list->entry_data.uint64);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_UINT128:
+			// json-c doesn't have a direct 128-bit integer type.
+			// Representing it as a string might be the best approach for lossless conversion.
+			char buffer[40];
+			snprintf(
+				buffer,
+				sizeof(buffer),
+				"%llu%016llu",
+				(unsigned long long)(entry_data_list->entry_data.uint128 >> 64),
+				(unsigned long long)(entry_data_list->entry_data.uint128 & 0xFFFFFFFFFFFFFFFFULL)
+			);
+			result.json = json_object_new_string(buffer);
+			result.next = entry_data_list->next;
+			break;
+		case MMDB_DATA_TYPE_INT32:
+			result.json = json_object_new_int((int)entry_data_list->entry_data.int32);
+			result.next = entry_data_list->next;
+			break;
+		default:
+			result.status = MMDB_INVALID_DATA_ERROR;
+	}
+
+	return result;
+}
 
 BEGINdoAction_NoStrings
 	smsg_t **ppMsg = (smsg_t **) pMsgData;
@@ -447,6 +578,8 @@ CODESTARTdoAction
 		str_split(&membuf);
 	}
 
+	mmdb_json json_result = mmdb_entry_data_list_to_json(entry_data_list);
+
 	DBGPRINTF("maxmindb returns: '%s'\n", membuf);
 	total_json = json_tokener_parse(membuf);
 	fclose(memstream);
@@ -471,7 +604,8 @@ CODESTARTdoAction
 		}
 		/* temp_json now contains the value we want to have, so set it */
 		json_object_get(temp_json);
-		msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], temp_json, 0, 0);
+		// msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], temp_json, 0, 0);
+		msgAddJSON(pMsg, (uchar *)pData->fieldList.varname[i], json_result.json, 0, 0);
 	}
 
 finalize_it:
